@@ -11,7 +11,9 @@
 // A parent agent calls the tool with a self-contained task; this server shells
 // out to the corresponding CLI, lets the child agent perform the task, and
 // returns the child's full output. In effect each tool is a spawned sub-agent
-// callable from inside another agent's session.
+// callable from inside another agent's session. Backends are declared in a small
+// in-code registry (see `backends`), so adding another CLI coding-agent is one
+// entry, not new code.
 //
 // Safety: tool-use (the child editing files / running commands) is DISABLED by
 // default. In the default mode the server runs the CLI with no permission-bypass,
@@ -84,144 +86,154 @@ type runOpts struct {
 	workingDir     string
 }
 
-// backend describes one CLI adapter. The run/timeout/truncate/header/
-// context-cancel/hop-guard logic in runAgent is shared across backends; each
-// backend only supplies its tool name, binary resolver, argument builder, and
-// mode-note formatter.
+// Model-facing tool descriptions. The prose differs per backend; the parameter
+// set is shared (see commonToolOptions) so the tool schemas can't drift.
+const (
+	geminiToolDescription = "Spawn a Gemini agent (via the Antigravity `agy` CLI) to perform a task and return its " +
+		"response. Give it a self-contained task in `task`; it runs non-interactively and returns Gemini's full " +
+		"output. By default the spawned agent can reason and answer but CANNOT take unattended actions (no file " +
+		"edits / command execution) — set `allow_tools: true` to let it act, which disables Gemini's permission " +
+		"prompts and runs it UNATTENDED, with edits landing in `working_dir`. Sandboxing is OFF by default; set " +
+		"`sandbox: true` to instead confine edits to an isolated scratch dir. Use `add_dirs` for workspace context " +
+		"and `working_dir` to set where it runs."
+
+	claudeToolDescription = "Spawn a Claude agent (via the `claude` CLI) to perform a task and return its response. " +
+		"Give it a self-contained task in `task`; it runs non-interactively (`claude --print`) and returns Claude's " +
+		"full output. By default the spawned agent can reason and answer but CANNOT take unattended actions (no file " +
+		"edits / command execution) — set `allow_tools: true` to let it act, which passes --dangerously-skip-permissions " +
+		"so Claude auto-approves its own permission prompts and runs UNATTENDED (it will edit files / run commands and " +
+		"consume Claude credits without further confirmation). Use `add_dirs` for workspace context and `working_dir` " +
+		"to set where it runs. Note: even reason-only runs consume Claude credits."
+
+	geminiAllowToolsDescription = "Allow the spawned agent to take actions (edit files in working_dir, run commands) by " +
+		"auto-approving its permission prompts (passes --dangerously-skip-permissions). Default false (reason/answer " +
+		"only). Use with care — this is unattended execution; scope it with working_dir."
+
+	claudeAllowToolsDescription = "Allow the spawned agent to take actions (edit files in working_dir, run commands) by " +
+		"auto-approving its permission prompts (passes --dangerously-skip-permissions). Default false (reason/answer " +
+		"only). Use with care — this is unattended execution that consumes Claude credits; scope it with working_dir."
+
+	sandboxDescription = "Confine the agent to an isolated scratch dir with terminal restrictions (--sandbox). Default " +
+		"false. WARNING: when true, the agent's file edits go to a scratch dir, NOT working_dir — use only for a " +
+		"confined 'compute but don't touch my files' run."
+)
+
+// backend declares one CLI adapter as DATA: the shared run/timeout/truncate/
+// header/context-cancel/hop-guard logic lives in runAgent, so adding a CLI
+// coding-agent is a single registry entry (see the registry below), not new code.
+// Optional flags (timeoutFlag, sandboxFlag) are "" when the CLI lacks them.
 type backend struct {
-	tool       string        // "gemini_agent" / "claude_agent"
-	cliName    string        // underlying CLI name for the "(<cli> returned no stdout)" note
-	resolveBin func() string // resolves the CLI executable path
-	buildArgs  func(o runOpts) []string
-	modeNote   func(o runOpts) string
-	// timeoutHeadroom is extra wall-clock added to the requested timeout before
-	// the child is hard-killed. Non-zero only for CLIs with their own internal
-	// timeout (gemini/agy); zero for claude (the context deadline is the timeout).
+	tool    string // MCP tool name, e.g. "gemini_agent"
+	cliName string // CLI binary name, e.g. "agy"; used for PATH/fallback lookup and the "(<cli> returned no stdout)" note
+	binEnv  string // env override for the CLI path, e.g. "AGY_BIN"
+
+	// Flag names. promptFlag carries the task as its VALUE and is emitted FIRST;
+	// every other flag follows. "" means the CLI does not support that flag.
+	promptFlag    string // "--print"
+	timeoutFlag   string // "--print-timeout" (gemini) | "" (claude: ctx deadline only)
+	modelFlag     string // "--model"
+	addDirFlag    string // "--add-dir"
+	skipPermsFlag string // "--dangerously-skip-permissions"
+	sandboxFlag   string // "--sandbox" (gemini) | "" (claude)
+
+	// timeoutHeadroom is extra wall-clock added to the requested timeout before the
+	// child is hard-killed. Non-zero only for CLIs with their own internal timeout
+	// (gemini/agy); zero for claude (the context deadline is the timeout).
 	timeoutHeadroom time.Duration
+
+	description    string // model-facing tool description
+	allowToolsDesc string // description for the allow_tools param
 }
 
-// resolveAgyBinary finds the `agy` executable. Priority: AGY_BIN env override,
-// then PATH, then the known install location. Claude Code may spawn this server
-// with a minimal PATH, so the explicit fallback matters.
-func resolveAgyBinary() string {
-	if v := strings.TrimSpace(os.Getenv("AGY_BIN")); v != "" {
+// supportsSandbox reports whether the backend exposes the sandbox option.
+func (b backend) supportsSandbox() bool { return b.sandboxFlag != "" }
+
+// resolveBin finds the backend's CLI executable: binEnv override → PATH →
+// ~/.local/bin/<cliName> → bare cliName. The explicit fallback matters because a
+// parent agent may spawn this server with a minimal PATH.
+func resolveBin(b backend) string {
+	if v := strings.TrimSpace(os.Getenv(b.binEnv)); v != "" {
 		return v
 	}
-	if p, err := exec.LookPath("agy"); err == nil {
+	if p, err := exec.LookPath(b.cliName); err == nil {
 		return p
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		fallback := filepath.Join(home, ".local", "bin", "agy")
+		fallback := filepath.Join(home, ".local", "bin", b.cliName)
 		if _, statErr := os.Stat(fallback); statErr == nil {
 			return fallback
 		}
 	}
-	return "agy"
+	return b.cliName
 }
 
-// resolveClaudeBinary finds the `claude` executable. Priority: CLAUDE_BIN env
-// override, then PATH, then the known install location. Mirrors
-// resolveAgyBinary — a Gemini parent may spawn this server with a minimal PATH,
-// so the explicit fallback matters.
-func resolveClaudeBinary() string {
-	if v := strings.TrimSpace(os.Getenv("CLAUDE_BIN")); v != "" {
-		return v
+// buildArgs builds the CLI invocation from the backend's flag spec. CRITICAL:
+// promptFlag takes the task as its VALUE and is emitted FIRST, with every other
+// flag AFTER it — putting another flag between promptFlag and the task makes the
+// CLI treat that flag as the prompt. Pure function — table-testable.
+func buildArgs(b backend, o runOpts) []string {
+	args := []string{b.promptFlag, o.task}
+	if b.timeoutFlag != "" {
+		args = append(args, b.timeoutFlag, fmt.Sprintf("%ds", o.timeoutSeconds))
 	}
-	if p, err := exec.LookPath("claude"); err == nil {
-		return p
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		fallback := filepath.Join(home, ".local", "bin", "claude")
-		if _, statErr := os.Stat(fallback); statErr == nil {
-			return fallback
-		}
-	}
-	return "claude"
-}
-
-// buildGeminiArgs builds the `agy` invocation. CRITICAL: `--print` takes the
-// prompt as its VALUE — the task must come immediately after it, with all other
-// flags AFTER the prompt. (agy usage: `agy --print "<prompt>" --print-timeout 10m`.)
-// Putting --print-timeout between --print and the task makes agy treat
-// "--print-timeout" as the prompt. Pure function — table-testable.
-func buildGeminiArgs(o runOpts) []string {
-	args := []string{
-		"--print", o.task,
-		"--print-timeout", fmt.Sprintf("%ds", o.timeoutSeconds),
-	}
-	if strings.TrimSpace(o.model) != "" {
-		args = append(args, "--model", o.model)
+	if b.modelFlag != "" && strings.TrimSpace(o.model) != "" {
+		args = append(args, b.modelFlag, o.model)
 	}
 	for _, d := range o.addDirs {
-		args = append(args, "--add-dir", d)
+		args = append(args, b.addDirFlag, d)
 	}
-	if o.allowTools {
-		args = append(args, "--dangerously-skip-permissions")
+	if o.allowTools && b.skipPermsFlag != "" {
+		args = append(args, b.skipPermsFlag)
 	}
-	if o.sandbox {
-		args = append(args, "--sandbox")
+	if o.sandbox && b.sandboxFlag != "" {
+		args = append(args, b.sandboxFlag)
 	}
 	return args
 }
 
-// buildClaudeArgs builds the `claude` invocation. As with agy, `--print` takes
-// the prompt as its VALUE, so the task comes immediately after it with all other
-// flags AFTER it. claude has NO --print-timeout flag (the timeout is enforced
-// purely by the process context deadline) and NO --sandbox flag (sandbox is
-// gemini-only). Pure function — table-testable.
-func buildClaudeArgs(o runOpts) []string {
-	args := []string{
-		"--print", o.task,
-	}
-	if strings.TrimSpace(o.model) != "" {
-		args = append(args, "--model", o.model)
-	}
-	for _, d := range o.addDirs {
-		args = append(args, "--add-dir", d)
-	}
-	if o.allowTools {
-		args = append(args, "--dangerously-skip-permissions")
-	}
-	return args
-}
-
-// geminiModeNote describes the run mode for gemini_agent's result header.
-func geminiModeNote(o runOpts) string {
+// modeNote describes the run mode for the result header.
+func modeNote(b backend, o runOpts) string {
 	if !o.allowTools {
 		return "tool-use: disabled (reason/answer only)"
 	}
 	note := "tool-use: ENABLED (--dangerously-skip-permissions)"
-	if o.sandbox {
+	if o.sandbox && b.supportsSandbox() {
 		note += " in --sandbox"
 	}
 	return note
 }
 
-// claudeModeNote describes the run mode for claude_agent's result header.
-func claudeModeNote(o runOpts) string {
-	if !o.allowTools {
-		return "tool-use: disabled (reason/answer only)"
-	}
-	return "tool-use: ENABLED (--dangerously-skip-permissions)"
-}
-
+// Backend registry. Adding a CLI coding-agent is one entry here — no new code.
 var geminiBackend = backend{
 	tool:            "gemini_agent",
 	cliName:         "agy",
-	resolveBin:      resolveAgyBinary,
-	buildArgs:       buildGeminiArgs,
-	modeNote:        geminiModeNote,
+	binEnv:          "AGY_BIN",
+	promptFlag:      "--print",
+	timeoutFlag:     "--print-timeout",
+	modelFlag:       "--model",
+	addDirFlag:      "--add-dir",
+	skipPermsFlag:   "--dangerously-skip-permissions",
+	sandboxFlag:     "--sandbox",
 	timeoutHeadroom: geminiTimeoutHeadroom,
+	description:     geminiToolDescription,
+	allowToolsDesc:  geminiAllowToolsDescription,
 }
 
 var claudeBackend = backend{
-	tool:       "claude_agent",
-	cliName:    "claude",
-	resolveBin: resolveClaudeBinary,
-	buildArgs:  buildClaudeArgs,
-	modeNote:   claudeModeNote,
-	// timeoutHeadroom: 0 — claude has no --print-timeout; the deadline is the timeout.
+	tool:          "claude_agent",
+	cliName:       "claude",
+	binEnv:        "CLAUDE_BIN",
+	promptFlag:    "--print",
+	modelFlag:     "--model",
+	addDirFlag:    "--add-dir",
+	skipPermsFlag: "--dangerously-skip-permissions",
+	// timeoutFlag/sandboxFlag "" — claude has neither; timeoutHeadroom 0 — deadline is the timeout.
+	description:    claudeToolDescription,
+	allowToolsDesc: claudeAllowToolsDescription,
 }
+
+// backends is the registry the server iterates to register tools.
+var backends = []backend{geminiBackend, claudeBackend}
 
 // parseHopEnv reads the current delegation depth and max from a getenv-style
 // lookup function. Invalid, missing, or out-of-range values fall back to the
@@ -270,46 +282,15 @@ func main() {
 		server.WithToolCapabilities(false),
 	)
 
-	s.AddTool(newGeminiTool(), makeHandler(geminiBackend, true))
-	s.AddTool(newClaudeTool(), makeHandler(claudeBackend, false))
+	for _, b := range backends {
+		s.AddTool(newTool(b), makeHandler(b))
+	}
 
 	if err := server.ServeStdio(s); err != nil {
 		fmt.Fprintf(os.Stderr, "agy-mcp: server error: %v\n", err)
 		os.Exit(1)
 	}
 }
-
-// Tool descriptions. The model-facing prose differs per backend; the parameter
-// set is shared (see commonToolOptions) to keep the two tools from drifting.
-const (
-	geminiToolDescription = "Spawn a Gemini agent (via the Antigravity `agy` CLI) to perform a task and return its " +
-		"response. Give it a self-contained task in `task`; it runs non-interactively and returns Gemini's full " +
-		"output. By default the spawned agent can reason and answer but CANNOT take unattended actions (no file " +
-		"edits / command execution) — set `allow_tools: true` to let it act, which disables Gemini's permission " +
-		"prompts and runs it UNATTENDED, with edits landing in `working_dir`. Sandboxing is OFF by default; set " +
-		"`sandbox: true` to instead confine edits to an isolated scratch dir. Use `add_dirs` for workspace context " +
-		"and `working_dir` to set where it runs."
-
-	claudeToolDescription = "Spawn a Claude agent (via the `claude` CLI) to perform a task and return its response. " +
-		"Give it a self-contained task in `task`; it runs non-interactively (`claude --print`) and returns Claude's " +
-		"full output. By default the spawned agent can reason and answer but CANNOT take unattended actions (no file " +
-		"edits / command execution) — set `allow_tools: true` to let it act, which passes --dangerously-skip-permissions " +
-		"so Claude auto-approves its own permission prompts and runs UNATTENDED (it will edit files / run commands and " +
-		"consume Claude credits without further confirmation). Use `add_dirs` for workspace context and `working_dir` " +
-		"to set where it runs. Note: even reason-only runs consume Claude credits."
-
-	geminiAllowToolsDescription = "Allow the spawned agent to take actions (edit files in working_dir, run commands) by " +
-		"auto-approving its permission prompts (passes --dangerously-skip-permissions). Default false (reason/answer " +
-		"only). Use with care — this is unattended execution; scope it with working_dir."
-
-	claudeAllowToolsDescription = "Allow the spawned agent to take actions (edit files in working_dir, run commands) by " +
-		"auto-approving its permission prompts (passes --dangerously-skip-permissions). Default false (reason/answer " +
-		"only). Use with care — this is unattended execution that consumes Claude credits; scope it with working_dir."
-
-	sandboxDescription = "Confine the agent to an isolated scratch dir with terminal restrictions (--sandbox). Default " +
-		"false. WARNING: when true, the agent's file edits go to a scratch dir, NOT working_dir — use only for a " +
-		"confined 'compute but don't touch my files' run."
-)
 
 // commonToolOptions returns the tool options shared by both tools: the given
 // description plus the task/add_dirs/working_dir/timeout_seconds/model/allow_tools
@@ -341,22 +322,19 @@ func commonToolOptions(description, allowToolsDescription string) []mcp.ToolOpti
 	}
 }
 
-// newGeminiTool builds the gemini_agent tool: the shared params plus gemini's
-// sandbox option.
-func newGeminiTool() mcp.Tool {
-	opts := commonToolOptions(geminiToolDescription, geminiAllowToolsDescription)
-	opts = append(opts, mcp.WithBoolean("sandbox", mcp.Description(sandboxDescription)))
-	return mcp.NewTool("gemini_agent", opts...)
+// newTool builds the MCP tool for a backend: the shared params, plus the sandbox
+// option for backends that support it.
+func newTool(b backend) mcp.Tool {
+	opts := commonToolOptions(b.description, b.allowToolsDesc)
+	if b.supportsSandbox() {
+		opts = append(opts, mcp.WithBoolean("sandbox", mcp.Description(sandboxDescription)))
+	}
+	return mcp.NewTool(b.tool, opts...)
 }
 
-// newClaudeTool builds the claude_agent tool: the shared params only (no sandbox).
-func newClaudeTool() mcp.Tool {
-	return mcp.NewTool("claude_agent", commonToolOptions(claudeToolDescription, claudeAllowToolsDescription)...)
-}
-
-// makeHandler returns the MCP handler for a backend. supportsSandbox controls
-// whether the `sandbox` param is read from the request (gemini only).
-func makeHandler(b backend, supportsSandbox bool) server.ToolHandlerFunc {
+// makeHandler returns the MCP handler for a backend. The `sandbox` param is read
+// from the request only for backends that support it (b.supportsSandbox()).
+func makeHandler(b backend) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		// Check context cancellation before executing.
 		if ctx.Err() != nil {
@@ -389,7 +367,7 @@ func makeHandler(b backend, supportsSandbox bool) server.ToolHandlerFunc {
 		// working_dir — useless for real project edits. Callers wanting a
 		// confined "compute but don't touch my files" run set sandbox: true
 		// explicitly. claude has no sandbox concept, so the param is not read.
-		if supportsSandbox {
+		if b.supportsSandbox() {
 			o.sandbox = req.GetBool("sandbox", false)
 		}
 
@@ -421,8 +399,8 @@ func runAgent(ctx context.Context, b backend, o runOpts) (*mcp.CallToolResult, e
 		)), nil
 	}
 
-	args := b.buildArgs(o)
-	modeNote := b.modeNote(o)
+	args := buildArgs(b, o)
+	modeNoteStr := modeNote(b, o)
 
 	// Give backends with their own internal timeout (gemini/agy) a little headroom
 	// beyond the requested timeout so they surface their own timeout message rather
@@ -437,7 +415,7 @@ func runAgent(ctx context.Context, b backend, o runOpts) (*mcp.CallToolResult, e
 	runCtx, cancel := context.WithTimeout(ctx, hardDeadline)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, b.resolveBin(), args...)
+	cmd := exec.CommandContext(runCtx, resolveBin(b), args...)
 	if strings.TrimSpace(o.workingDir) != "" {
 		cmd.Dir = o.workingDir
 	}
@@ -468,14 +446,14 @@ func runAgent(ctx context.Context, b backend, o runOpts) (*mcp.CallToolResult, e
 	if runCtx.Err() == context.DeadlineExceeded {
 		return mcp.NewToolResultError(fmt.Sprintf(
 			"%s timed out after %s (%s).\nPartial stdout:\n%s\nstderr:\n%s",
-			b.tool, elapsed, modeNote, truncate(stdout.String(), 8000), truncate(stderr.String(), 2000),
+			b.tool, elapsed, modeNoteStr, truncate(stdout.String(), 8000), truncate(stderr.String(), 2000),
 		)), nil
 	}
 
 	if runErr != nil {
 		return mcp.NewToolResultError(fmt.Sprintf(
 			"%s failed (%s): %v\nstderr:\n%s\nstdout:\n%s",
-			b.tool, modeNote, runErr, truncate(stderr.String(), 4000), truncate(stdout.String(), 8000),
+			b.tool, modeNoteStr, runErr, truncate(stderr.String(), 4000), truncate(stdout.String(), 8000),
 		)), nil
 	}
 
@@ -487,7 +465,7 @@ func runAgent(ctx context.Context, b backend, o runOpts) (*mcp.CallToolResult, e
 		}
 	}
 
-	header := fmt.Sprintf("[%s | %s | %s]\n\n", b.tool, modeNote, elapsed)
+	header := fmt.Sprintf("[%s | %s | %s]\n\n", b.tool, modeNoteStr, elapsed)
 	return mcp.NewToolResultText(header + out), nil
 }
 

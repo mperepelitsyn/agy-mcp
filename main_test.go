@@ -166,7 +166,7 @@ func TestBuildClaudeArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildClaudeArgs(tt.in)
+			got := buildArgs(claudeBackend, tt.in)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("buildClaudeArgs(%+v) = %#v; want %#v", tt.in, got, tt.want)
 			}
@@ -246,7 +246,7 @@ func TestBuildGeminiArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildGeminiArgs(tt.in)
+			got := buildArgs(geminiBackend, tt.in)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("buildGeminiArgs(%+v) = %#v; want %#v", tt.in, got, tt.want)
 			}
@@ -401,14 +401,14 @@ func TestChildHopEnv(t *testing.T) {
 func TestResolveAgyBinary(t *testing.T) {
 	// AGY_BIN override takes top priority and is reachable without network.
 	t.Setenv("AGY_BIN", "/custom/path/to/agy")
-	if got := resolveAgyBinary(); got != "/custom/path/to/agy" {
+	if got := resolveBin(geminiBackend); got != "/custom/path/to/agy" {
 		t.Errorf("resolveAgyBinary() with AGY_BIN set = %q; want %q", got, "/custom/path/to/agy")
 	}
 
 	// Whitespace-only override is treated as unset (falls through to lookup/fallback,
 	// which must never be the override value).
 	t.Setenv("AGY_BIN", "   ")
-	if got := resolveAgyBinary(); got == "   " {
+	if got := resolveBin(geminiBackend); got == "   " {
 		t.Errorf("resolveAgyBinary() treated whitespace AGY_BIN as a path: %q", got)
 	}
 }
@@ -416,14 +416,14 @@ func TestResolveAgyBinary(t *testing.T) {
 func TestResolveClaudeBinary(t *testing.T) {
 	// CLAUDE_BIN override takes top priority and is reachable without network.
 	t.Setenv("CLAUDE_BIN", "/custom/path/to/claude")
-	if got := resolveClaudeBinary(); got != "/custom/path/to/claude" {
+	if got := resolveBin(claudeBackend); got != "/custom/path/to/claude" {
 		t.Errorf("resolveClaudeBinary() with CLAUDE_BIN set = %q; want %q", got, "/custom/path/to/claude")
 	}
 
 	// Whitespace-only override is treated as unset (falls through to lookup/fallback,
 	// which must never be the override value).
 	t.Setenv("CLAUDE_BIN", "   ")
-	if got := resolveClaudeBinary(); got == "   " {
+	if got := resolveBin(claudeBackend); got == "   " {
 		t.Errorf("resolveClaudeBinary() treated whitespace CLAUDE_BIN as a path: %q", got)
 	}
 }
@@ -431,37 +431,37 @@ func TestResolveClaudeBinary(t *testing.T) {
 func TestModeNotes(t *testing.T) {
 	tests := []struct {
 		name string
-		note func(runOpts) string
+		b    backend
 		in   runOpts
 		want string
 	}{
 		{
 			name: "gemini reason-only",
-			note: geminiModeNote,
+			b:    geminiBackend,
 			in:   runOpts{},
 			want: "tool-use: disabled (reason/answer only)",
 		},
 		{
 			name: "gemini allow_tools without sandbox",
-			note: geminiModeNote,
+			b:    geminiBackend,
 			in:   runOpts{allowTools: true},
 			want: "tool-use: ENABLED (--dangerously-skip-permissions)",
 		},
 		{
 			name: "gemini allow_tools with sandbox",
-			note: geminiModeNote,
+			b:    geminiBackend,
 			in:   runOpts{allowTools: true, sandbox: true},
 			want: "tool-use: ENABLED (--dangerously-skip-permissions) in --sandbox",
 		},
 		{
 			name: "claude reason-only",
-			note: claudeModeNote,
+			b:    claudeBackend,
 			in:   runOpts{},
 			want: "tool-use: disabled (reason/answer only)",
 		},
 		{
 			name: "claude allow_tools (sandbox ignored)",
-			note: claudeModeNote,
+			b:    claudeBackend,
 			in:   runOpts{allowTools: true, sandbox: true},
 			want: "tool-use: ENABLED (--dangerously-skip-permissions)",
 		},
@@ -469,7 +469,7 @@ func TestModeNotes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.note(tt.in); got != tt.want {
+			if got := modeNote(tt.b, tt.in); got != tt.want {
 				t.Errorf("modeNote(%+v) = %q; want %q", tt.in, got, tt.want)
 			}
 		})
@@ -493,9 +493,12 @@ func writeFakeBin(t *testing.T, script string) string {
 	return p
 }
 
-// withBin returns a copy of b whose resolveBin yields the given path.
+// withBin returns a copy of b whose CLI resolves to the given (absolute) path:
+// it sets cliName to the path and clears binEnv so resolveBin returns it via
+// LookPath (an absolute, executable path resolves to itself).
 func withBin(b backend, path string) backend {
-	b.resolveBin = func() string { return path }
+	b.cliName = path
+	b.binEnv = ""
 	return b
 }
 
@@ -756,15 +759,15 @@ func TestMakeHandlerParsing(t *testing.T) {
 	t.Setenv(hopMaxEnv, "2")
 	echo := writeFakeBin(t, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
 
-	call := func(b backend, supportsSandbox bool, args map[string]any) (*mcp.CallToolResult, error) {
-		h := makeHandler(withBin(b, echo), supportsSandbox)
+	call := func(b backend, args map[string]any) (*mcp.CallToolResult, error) {
+		h := makeHandler(withBin(b, echo))
 		req := mcp.CallToolRequest{Params: mcp.CallToolParams{Name: b.tool, Arguments: args}}
 		return h(context.Background(), req)
 	}
 
 	t.Run("empty/whitespace task is rejected before spawning", func(t *testing.T) {
 		for _, b := range []backend{geminiBackend, claudeBackend} {
-			res, err := call(b, true, map[string]any{"task": "   "})
+			res, err := call(b, map[string]any{"task": "   "})
 			if err != nil {
 				t.Fatalf("[%s] unexpected Go error: %v", b.tool, err)
 			}
@@ -790,7 +793,7 @@ func TestMakeHandlerParsing(t *testing.T) {
 			{"in range -> kept", map[string]any{"task": "x", "timeout_seconds": 600}, "600s"},
 		}
 		for _, c := range cases {
-			res, _ := call(geminiBackend, true, c.args)
+			res, _ := call(geminiBackend, c.args)
 			if a := handlerEchoArgs(t, res); !argsHave(a, "--print-timeout", c.want) {
 				t.Errorf("%s: want --print-timeout %s; args=%v", c.name, c.want, a)
 			}
@@ -798,19 +801,19 @@ func TestMakeHandlerParsing(t *testing.T) {
 	})
 
 	t.Run("sandbox gated to gemini only", func(t *testing.T) {
-		res, _ := call(geminiBackend, true, map[string]any{"task": "x", "sandbox": true})
+		res, _ := call(geminiBackend, map[string]any{"task": "x", "sandbox": true})
 		if a := handlerEchoArgs(t, res); !argsContain(a, "--sandbox") {
 			t.Errorf("gemini should pass --sandbox; args=%v", a)
 		}
-		// claude is registered with supportsSandbox=false: the param is never read.
-		res, _ = call(claudeBackend, false, map[string]any{"task": "x", "sandbox": true})
+		// claude has no sandboxFlag, so b.supportsSandbox() is false and it's never read.
+		res, _ = call(claudeBackend, map[string]any{"task": "x", "sandbox": true})
 		if a := handlerEchoArgs(t, res); argsContain(a, "--sandbox") {
 			t.Errorf("claude must never pass --sandbox; args=%v", a)
 		}
 	})
 
 	t.Run("add_dirs trimmed and empties dropped", func(t *testing.T) {
-		res, _ := call(geminiBackend, true, map[string]any{
+		res, _ := call(geminiBackend, map[string]any{
 			"task":     "x",
 			"add_dirs": []any{"/a", "  ", "", " /b "},
 		})
@@ -824,18 +827,18 @@ func TestMakeHandlerParsing(t *testing.T) {
 	})
 
 	t.Run("model trimmed; blank dropped", func(t *testing.T) {
-		res, _ := call(claudeBackend, false, map[string]any{"task": "x", "model": "  opus  "})
+		res, _ := call(claudeBackend, map[string]any{"task": "x", "model": "  opus  "})
 		if a := handlerEchoArgs(t, res); !argsHave(a, "--model", "opus") {
 			t.Errorf("model should be trimmed to opus; args=%v", a)
 		}
-		res, _ = call(claudeBackend, false, map[string]any{"task": "x", "model": "   "})
+		res, _ = call(claudeBackend, map[string]any{"task": "x", "model": "   "})
 		if a := handlerEchoArgs(t, res); argsContain(a, "--model") {
 			t.Errorf("blank model must be dropped; args=%v", a)
 		}
 	})
 
 	t.Run("allow_tools adds skip-permissions", func(t *testing.T) {
-		res, _ := call(claudeBackend, false, map[string]any{"task": "x", "allow_tools": true})
+		res, _ := call(claudeBackend, map[string]any{"task": "x", "allow_tools": true})
 		if a := handlerEchoArgs(t, res); !argsContain(a, "--dangerously-skip-permissions") {
 			t.Errorf("allow_tools should pass the skip flag; args=%v", a)
 		}
@@ -845,7 +848,7 @@ func TestMakeHandlerParsing(t *testing.T) {
 		dir := t.TempDir()
 		// The fake writes a marker into its cwd; if working_dir applied, it lands in dir.
 		marker := writeFakeBin(t, "#!/bin/sh\ntouch cwd-marker\n")
-		h := makeHandler(withBin(geminiBackend, marker), true)
+		h := makeHandler(withBin(geminiBackend, marker))
 		req := mcp.CallToolRequest{Params: mcp.CallToolParams{
 			Name:      geminiBackend.tool,
 			Arguments: map[string]any{"task": "x", "working_dir": dir},
@@ -862,7 +865,7 @@ func TestMakeHandlerParsing(t *testing.T) {
 		for _, b := range []backend{geminiBackend, claudeBackend} {
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel()
-			h := makeHandler(withBin(b, echo), true)
+			h := makeHandler(withBin(b, echo))
 			req := mcp.CallToolRequest{Params: mcp.CallToolParams{Name: b.tool, Arguments: map[string]any{"task": "x"}}}
 			res, err := h(ctx, req)
 			if err == nil {
@@ -891,45 +894,35 @@ func writeExec(t *testing.T, dir, name string) string {
 }
 
 func TestResolveBinaryFallbacks(t *testing.T) {
-	backends := []struct {
-		name    string
-		envKey  string
-		binName string
-		resolve func() string
-	}{
-		{"agy", "AGY_BIN", "agy", resolveAgyBinary},
-		{"claude", "CLAUDE_BIN", "claude", resolveClaudeBinary},
-	}
-
-	for _, b := range backends {
-		t.Run(b.name, func(t *testing.T) {
+	for _, b := range []backend{geminiBackend, claudeBackend} {
+		t.Run(b.cliName, func(t *testing.T) {
 			t.Run("found on PATH via LookPath", func(t *testing.T) {
-				t.Setenv(b.envKey, "")
+				t.Setenv(b.binEnv, "")
 				dir := t.TempDir()
-				want := writeExec(t, dir, b.binName)
+				want := writeExec(t, dir, b.cliName)
 				t.Setenv("PATH", dir)
-				if got := b.resolve(); got != want {
-					t.Errorf("resolve() = %q; want PATH hit %q", got, want)
+				if got := resolveBin(b); got != want {
+					t.Errorf("resolveBin() = %q; want PATH hit %q", got, want)
 				}
 			})
 
 			t.Run("falls back to ~/.local/bin", func(t *testing.T) {
-				t.Setenv(b.envKey, "")
+				t.Setenv(b.binEnv, "")
 				t.Setenv("PATH", t.TempDir()) // a dir without the binary
 				home := t.TempDir()
 				t.Setenv("HOME", home)
-				want := writeExec(t, filepath.Join(home, ".local", "bin"), b.binName)
-				if got := b.resolve(); got != want {
-					t.Errorf("resolve() = %q; want ~/.local/bin fallback %q", got, want)
+				want := writeExec(t, filepath.Join(home, ".local", "bin"), b.cliName)
+				if got := resolveBin(b); got != want {
+					t.Errorf("resolveBin() = %q; want ~/.local/bin fallback %q", got, want)
 				}
 			})
 
 			t.Run("falls back to bare name", func(t *testing.T) {
-				t.Setenv(b.envKey, "")
+				t.Setenv(b.binEnv, "")
 				t.Setenv("PATH", t.TempDir())
 				t.Setenv("HOME", t.TempDir()) // no .local/bin/<bin>
-				if got := b.resolve(); got != b.binName {
-					t.Errorf("resolve() = %q; want bare name %q", got, b.binName)
+				if got := resolveBin(b); got != b.cliName {
+					t.Errorf("resolveBin() = %q; want bare name %q", got, b.cliName)
 				}
 			})
 		})
@@ -952,8 +945,8 @@ func TestBackendTimeoutHeadroom(t *testing.T) {
 // schemas: both expose the shared params; only gemini exposes `sandbox`; and the
 // gemini description does NOT claim acting mode is sandboxed by default.
 func TestToolSchemas(t *testing.T) {
-	gemini := newGeminiTool()
-	claude := newClaudeTool()
+	gemini := newTool(geminiBackend)
+	claude := newTool(claudeBackend)
 
 	if gemini.Name != "gemini_agent" {
 		t.Errorf("gemini tool name = %q; want gemini_agent", gemini.Name)
@@ -987,5 +980,43 @@ func TestToolSchemas(t *testing.T) {
 	}
 	if !strings.Contains(gemini.Description, "OFF by default") {
 		t.Errorf("gemini description should state sandboxing is OFF by default: %q", gemini.Description)
+	}
+}
+
+// TestBackendRegistry validates invariants across every registry entry, so a
+// malformed new backend is caught here rather than at runtime. This is the
+// data-driven equivalent of the per-backend tests above.
+func TestBackendRegistry(t *testing.T) {
+	if len(backends) == 0 {
+		t.Fatal("backends registry is empty")
+	}
+	seen := map[string]bool{}
+	for _, b := range backends {
+		t.Run(b.tool, func(t *testing.T) {
+			if b.tool == "" || b.cliName == "" || b.binEnv == "" || b.promptFlag == "" {
+				t.Errorf("backend missing a required field: %+v", b)
+			}
+			if seen[b.tool] {
+				t.Errorf("duplicate tool name %q in registry", b.tool)
+			}
+			seen[b.tool] = true
+
+			// buildArgs must always start with the prompt flag carrying the task.
+			got := buildArgs(b, runOpts{task: "T", timeoutSeconds: 1})
+			if len(got) < 2 || got[0] != b.promptFlag || got[1] != "T" {
+				t.Errorf("buildArgs must start with %q <task>; got %#v", b.promptFlag, got)
+			}
+
+			// The tool must expose the shared params, and the sandbox param iff supported.
+			tool := newTool(b)
+			for _, p := range []string{"task", "add_dirs", "working_dir", "timeout_seconds", "model", "allow_tools"} {
+				if _, ok := tool.InputSchema.Properties[p]; !ok {
+					t.Errorf("tool %q missing shared param %q", b.tool, p)
+				}
+			}
+			if _, ok := tool.InputSchema.Properties["sandbox"]; ok != b.supportsSandbox() {
+				t.Errorf("tool %q sandbox-param=%v; supportsSandbox()=%v", b.tool, ok, b.supportsSandbox())
+			}
+		})
 	}
 }
