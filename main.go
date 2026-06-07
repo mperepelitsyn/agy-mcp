@@ -151,7 +151,7 @@ func (b backend) supportsSandbox() bool { return b.sandboxFlag != "" }
 // resolveBin finds the backend's CLI executable: binEnv override → PATH →
 // ~/.local/bin/<cliName> → bare cliName. The explicit fallback matters because a
 // parent agent may spawn this server with a minimal PATH.
-func resolveBin(b backend) string {
+func (b backend) resolveBin() string {
 	if v := strings.TrimSpace(os.Getenv(b.binEnv)); v != "" {
 		return v
 	}
@@ -170,8 +170,9 @@ func resolveBin(b backend) string {
 // buildArgs builds the CLI invocation from the backend's flag spec. CRITICAL:
 // promptFlag takes the task as its VALUE and is emitted FIRST, with every other
 // flag AFTER it — putting another flag between promptFlag and the task makes the
-// CLI treat that flag as the prompt. Pure function — table-testable.
-func buildArgs(b backend, o runOpts) []string {
+// CLI treat that flag as the prompt. An empty flag name means the CLI lacks that
+// option, so it (and its value/loop) is skipped. Pure — table-testable.
+func (b backend) buildArgs(o runOpts) []string {
 	args := []string{b.promptFlag, o.task}
 	if b.timeoutFlag != "" {
 		args = append(args, b.timeoutFlag, fmt.Sprintf("%ds", o.timeoutSeconds))
@@ -179,8 +180,10 @@ func buildArgs(b backend, o runOpts) []string {
 	if b.modelFlag != "" && strings.TrimSpace(o.model) != "" {
 		args = append(args, b.modelFlag, o.model)
 	}
-	for _, d := range o.addDirs {
-		args = append(args, b.addDirFlag, d)
+	if b.addDirFlag != "" {
+		for _, d := range o.addDirs {
+			args = append(args, b.addDirFlag, d)
+		}
 	}
 	if o.allowTools && b.skipPermsFlag != "" {
 		args = append(args, b.skipPermsFlag)
@@ -192,7 +195,7 @@ func buildArgs(b backend, o runOpts) []string {
 }
 
 // modeNote describes the run mode for the result header.
-func modeNote(b backend, o runOpts) string {
+func (b backend) modeNote(o runOpts) string {
 	if !o.allowTools {
 		return "tool-use: disabled (reason/answer only)"
 	}
@@ -203,37 +206,45 @@ func modeNote(b backend, o runOpts) string {
 	return note
 }
 
-// Backend registry. Adding a CLI coding-agent is one entry here — no new code.
-var geminiBackend = backend{
-	tool:            "gemini_agent",
-	cliName:         "agy",
-	binEnv:          "AGY_BIN",
-	promptFlag:      "--print",
-	timeoutFlag:     "--print-timeout",
-	modelFlag:       "--model",
-	addDirFlag:      "--add-dir",
-	skipPermsFlag:   "--dangerously-skip-permissions",
-	sandboxFlag:     "--sandbox",
-	timeoutHeadroom: geminiTimeoutHeadroom,
-	description:     geminiToolDescription,
-	allowToolsDesc:  geminiAllowToolsDescription,
+// backends is the registry and SINGLE SOURCE OF TRUTH: adding a CLI coding-agent
+// is one entry here — no new code, and main() iterates it to register tools. The
+// named vars below are derived from it purely for convenient test reference, so a
+// new entry can never be silently forgotten.
+var backends = []backend{
+	{
+		tool:            "gemini_agent",
+		cliName:         "agy",
+		binEnv:          "AGY_BIN",
+		promptFlag:      "--print",
+		timeoutFlag:     "--print-timeout",
+		modelFlag:       "--model",
+		addDirFlag:      "--add-dir",
+		skipPermsFlag:   "--dangerously-skip-permissions",
+		sandboxFlag:     "--sandbox",
+		timeoutHeadroom: geminiTimeoutHeadroom,
+		description:     geminiToolDescription,
+		allowToolsDesc:  geminiAllowToolsDescription,
+	},
+	{
+		tool:          "claude_agent",
+		cliName:       "claude",
+		binEnv:        "CLAUDE_BIN",
+		promptFlag:    "--print",
+		modelFlag:     "--model",
+		addDirFlag:    "--add-dir",
+		skipPermsFlag: "--dangerously-skip-permissions",
+		// timeoutFlag/sandboxFlag "" — claude has neither; timeoutHeadroom 0 — deadline is the timeout.
+		description:    claudeToolDescription,
+		allowToolsDesc: claudeAllowToolsDescription,
+	},
 }
 
-var claudeBackend = backend{
-	tool:          "claude_agent",
-	cliName:       "claude",
-	binEnv:        "CLAUDE_BIN",
-	promptFlag:    "--print",
-	modelFlag:     "--model",
-	addDirFlag:    "--add-dir",
-	skipPermsFlag: "--dangerously-skip-permissions",
-	// timeoutFlag/sandboxFlag "" — claude has neither; timeoutHeadroom 0 — deadline is the timeout.
-	description:    claudeToolDescription,
-	allowToolsDesc: claudeAllowToolsDescription,
-}
-
-// backends is the registry the server iterates to register tools.
-var backends = []backend{geminiBackend, claudeBackend}
+// Named references into the registry, for tests. Derived from backends so they
+// can't drift from what the server actually registers.
+var (
+	geminiBackend = backends[0]
+	claudeBackend = backends[1]
+)
 
 // parseHopEnv reads the current delegation depth and max from a getenv-style
 // lookup function. Invalid, missing, or out-of-range values fall back to the
@@ -399,8 +410,8 @@ func runAgent(ctx context.Context, b backend, o runOpts) (*mcp.CallToolResult, e
 		)), nil
 	}
 
-	args := buildArgs(b, o)
-	modeNoteStr := modeNote(b, o)
+	args := b.buildArgs(o)
+	modeNoteStr := b.modeNote(o)
 
 	// Give backends with their own internal timeout (gemini/agy) a little headroom
 	// beyond the requested timeout so they surface their own timeout message rather
@@ -415,7 +426,7 @@ func runAgent(ctx context.Context, b backend, o runOpts) (*mcp.CallToolResult, e
 	runCtx, cancel := context.WithTimeout(ctx, hardDeadline)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, resolveBin(b), args...)
+	cmd := exec.CommandContext(runCtx, b.resolveBin(), args...)
 	if strings.TrimSpace(o.workingDir) != "" {
 		cmd.Dir = o.workingDir
 	}
