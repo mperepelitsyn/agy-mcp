@@ -74,6 +74,24 @@ func TestTruncate(t *testing.T) {
 			max:  5,
 			want: "",
 		},
+		{
+			name: "negative limit on non-empty string does not panic",
+			in:   "hello",
+			max:  -1,
+			want: "\n…(truncated, 5 bytes total)",
+		},
+		{
+			name: "zero limit on non-empty string",
+			in:   "hello",
+			max:  0,
+			want: "\n…(truncated, 5 bytes total)",
+		},
+		{
+			name: "negative limit on empty string",
+			in:   "",
+			max:  -1,
+			want: "",
+		},
 	}
 
 	for _, tt := range tests {
@@ -278,15 +296,33 @@ func TestParseHopEnv(t *testing.T) {
 			wantDepth: 1,
 			wantMax:   defaultHopMax,
 		},
+		{
+			name:      "zero max is out of range and falls back to default (not 'block all')",
+			env:       map[string]string{hopMaxEnv: "0"},
+			wantDepth: defaultHopDepth,
+			wantMax:   defaultHopMax,
+		},
+		{
+			name:      "negative max falls back to default",
+			env:       map[string]string{hopMaxEnv: "-3"},
+			wantDepth: defaultHopDepth,
+			wantMax:   defaultHopMax,
+		},
+		{
+			name:      "negative depth falls back to default depth",
+			env:       map[string]string{hopDepthEnv: "-1", hopMaxEnv: "4"},
+			wantDepth: defaultHopDepth,
+			wantMax:   4,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			getenv := func(k string) string { return tt.env[k] }
-			depth, max := parseHopEnv(getenv)
-			if depth != tt.wantDepth || max != tt.wantMax {
+			depth, hopMax := parseHopEnv(getenv)
+			if depth != tt.wantDepth || hopMax != tt.wantMax {
 				t.Errorf("parseHopEnv(%v) = (depth=%d, max=%d); want (depth=%d, max=%d)",
-					tt.env, depth, max, tt.wantDepth, tt.wantMax)
+					tt.env, depth, hopMax, tt.wantDepth, tt.wantMax)
 			}
 		})
 	}
@@ -608,16 +644,15 @@ func TestRunAgentParentCancel(t *testing.T) {
 func TestRunAgentTimeoutResult(t *testing.T) {
 	t.Setenv(hopDepthEnv, "0")
 	t.Setenv(hopMaxEnv, "2")
-	// Shrink the headroom so the hard deadline fires quickly; restore after.
-	orig := timeoutHeadroom
-	timeoutHeadroom = 80 * time.Millisecond
-	defer func() { timeoutHeadroom = orig }()
 
 	for _, base := range []backend{geminiBackend, claudeBackend} {
 		t.Run(base.tool, func(t *testing.T) {
 			tb := withBin(base, writeFakeBin(t, "#!/bin/sh\nexec sleep 5\n"))
-			// timeoutSeconds 0 => hardDeadline == timeoutHeadroom (80ms). Parent ctx
-			// has no deadline, so the child-timeout branch (not parent-cancel) fires.
+			// Shrink the per-backend headroom (no global mutation) so the hard
+			// deadline fires quickly. timeoutSeconds 0 => hardDeadline ==
+			// timeoutHeadroom (80ms). Parent ctx has no deadline, so the
+			// child-timeout branch (not parent-cancel) fires.
+			tb.timeoutHeadroom = 80 * time.Millisecond
 			res, err := runAgent(context.Background(), tb, runOpts{task: "slow", timeoutSeconds: 0})
 			if err != nil {
 				t.Fatalf("expected a tool result, got Go error: %v", err)
@@ -629,6 +664,44 @@ func TestRunAgentTimeoutResult(t *testing.T) {
 				t.Errorf("expected timeout message, got %q", txt)
 			}
 		})
+	}
+}
+
+// TestRunAgentKillsGrandchild reproduces the grandchild-pipe hang: the fake
+// child backgrounds a grandchild that inherits stdout and sleeps far past the
+// deadline, then blocks itself. Without process-group kill + WaitDelay, the
+// grandchild holds the stdout pipe open and cmd.Run() blocks for the
+// grandchild's full lifetime. The fix must make runAgent return promptly.
+func TestRunAgentKillsGrandchild(t *testing.T) {
+	t.Setenv(hopDepthEnv, "0")
+	t.Setenv(hopMaxEnv, "2")
+
+	bin := writeFakeBin(t, "#!/bin/sh\nsleep 30 &\nsleep 30\n")
+	tb := withBin(geminiBackend, bin)
+	tb.timeoutHeadroom = 150 * time.Millisecond // hardDeadline (timeoutSeconds 0) == 150ms
+
+	type out struct {
+		res *mcp.CallToolResult
+		err error
+	}
+	ch := make(chan out, 1)
+	go func() {
+		res, err := runAgent(context.Background(), tb, runOpts{task: "x", timeoutSeconds: 0})
+		ch <- out{res, err}
+	}()
+
+	// Comfortably under the 30s grandchild sleep but above the 150ms deadline +
+	// the 5s WaitDelay backstop, so a real hang is unambiguous.
+	select {
+	case o := <-ch:
+		if o.err != nil {
+			t.Fatalf("expected a tool result, got Go error: %v", o.err)
+		}
+		if o.res == nil || !o.res.IsError || !strings.Contains(resultText(t, o.res), "timed out") {
+			t.Fatalf("expected a timeout error result, got %+v", o.res)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("runAgent hung: a grandchild holding the stdout pipe blocked cmd.Run past the deadline")
 	}
 }
 
@@ -860,5 +933,59 @@ func TestResolveBinaryFallbacks(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// TestBackendTimeoutHeadroom asserts the per-backend headroom: gemini (which has
+// its own --print-timeout) gets headroom; claude (no internal timeout) gets none,
+// so its context deadline equals the requested timeout.
+func TestBackendTimeoutHeadroom(t *testing.T) {
+	if geminiBackend.timeoutHeadroom != geminiTimeoutHeadroom {
+		t.Errorf("geminiBackend.timeoutHeadroom = %v; want %v", geminiBackend.timeoutHeadroom, geminiTimeoutHeadroom)
+	}
+	if claudeBackend.timeoutHeadroom != 0 {
+		t.Errorf("claudeBackend.timeoutHeadroom = %v; want 0 (no --print-timeout)", claudeBackend.timeoutHeadroom)
+	}
+}
+
+// TestToolSchemas verifies the deduped tool builders produce correct, accurate
+// schemas: both expose the shared params; only gemini exposes `sandbox`; and the
+// gemini description does NOT claim acting mode is sandboxed by default.
+func TestToolSchemas(t *testing.T) {
+	gemini := newGeminiTool()
+	claude := newClaudeTool()
+
+	if gemini.Name != "gemini_agent" {
+		t.Errorf("gemini tool name = %q; want gemini_agent", gemini.Name)
+	}
+	if claude.Name != "claude_agent" {
+		t.Errorf("claude tool name = %q; want claude_agent", claude.Name)
+	}
+
+	// Shared params present on both.
+	for _, p := range []string{"task", "add_dirs", "working_dir", "timeout_seconds", "model", "allow_tools"} {
+		if _, ok := gemini.InputSchema.Properties[p]; !ok {
+			t.Errorf("gemini tool missing shared param %q", p)
+		}
+		if _, ok := claude.InputSchema.Properties[p]; !ok {
+			t.Errorf("claude tool missing shared param %q", p)
+		}
+	}
+
+	// sandbox is gemini-only.
+	if _, ok := gemini.InputSchema.Properties["sandbox"]; !ok {
+		t.Error("gemini tool should expose the sandbox param")
+	}
+	if _, ok := claude.InputSchema.Properties["sandbox"]; ok {
+		t.Error("claude tool must NOT expose a sandbox param")
+	}
+
+	// The gemini description must not claim sandbox-by-default (the bug this fixes),
+	// and should state sandboxing is off by default.
+	if strings.Contains(gemini.Description, "by default) runs it in a restricted sandbox") {
+		t.Errorf("gemini description still claims default sandbox: %q", gemini.Description)
+	}
+	if !strings.Contains(gemini.Description, "OFF by default") {
+		t.Errorf("gemini description should state sandboxing is OFF by default: %q", gemini.Description)
 	}
 }

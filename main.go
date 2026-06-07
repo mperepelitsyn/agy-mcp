@@ -58,12 +58,18 @@ const (
 	hopMaxEnv       = "AGENT_HOP_MAX"
 	defaultHopMax   = 2
 	defaultHopDepth = 0
-)
 
-// timeoutHeadroom is the extra wall-clock allowed beyond the requested timeout
-// before the child process is hard-killed, so the child can surface its own
-// timeout message first. A var (not a const) so tests can shrink it.
-var timeoutHeadroom = 30 * time.Second
+	// geminiTimeoutHeadroom is the extra wall-clock allowed beyond the requested
+	// timeout before agy is hard-killed, so agy's own --print-timeout fires first
+	// and surfaces its message. claude has no --print-timeout, so its backend uses
+	// zero headroom (the context deadline IS the timeout).
+	geminiTimeoutHeadroom = 30 * time.Second
+
+	// childWaitDelay bounds how long cmd.Run may block on stdout/stderr I/O after
+	// the child is killed, so a grandchild that inherited the pipes cannot hang the
+	// call past the deadline. Paired with process-group kill (setupProcessGroup).
+	childWaitDelay = 5 * time.Second
+)
 
 // runOpts carries the fully-parsed, backend-agnostic parameters of a single
 // tool invocation. It is a plain struct (no req access) so that buildArgs can
@@ -88,6 +94,10 @@ type backend struct {
 	resolveBin func() string // resolves the CLI executable path
 	buildArgs  func(o runOpts) []string
 	modeNote   func(o runOpts) string
+	// timeoutHeadroom is extra wall-clock added to the requested timeout before
+	// the child is hard-killed. Non-zero only for CLIs with their own internal
+	// timeout (gemini/agy); zero for claude (the context deadline is the timeout).
+	timeoutHeadroom time.Duration
 }
 
 // resolveAgyBinary finds the `agy` executable. Priority: AGY_BIN env override,
@@ -196,11 +206,12 @@ func claudeModeNote(o runOpts) string {
 }
 
 var geminiBackend = backend{
-	tool:       "gemini_agent",
-	cliName:    "agy",
-	resolveBin: resolveAgyBinary,
-	buildArgs:  buildGeminiArgs,
-	modeNote:   geminiModeNote,
+	tool:            "gemini_agent",
+	cliName:         "agy",
+	resolveBin:      resolveAgyBinary,
+	buildArgs:       buildGeminiArgs,
+	modeNote:        geminiModeNote,
+	timeoutHeadroom: geminiTimeoutHeadroom,
 }
 
 var claudeBackend = backend{
@@ -209,18 +220,21 @@ var claudeBackend = backend{
 	resolveBin: resolveClaudeBinary,
 	buildArgs:  buildClaudeArgs,
 	modeNote:   claudeModeNote,
+	// timeoutHeadroom: 0 — claude has no --print-timeout; the deadline is the timeout.
 }
 
 // parseHopEnv reads the current delegation depth and max from a getenv-style
-// lookup function. Invalid or missing values fall back to the defaults. Pure
-// function — table-testable (pass it a map-backed getenv in tests).
+// lookup function. Invalid, missing, or out-of-range values fall back to the
+// defaults: a negative depth → defaultHopDepth, and a max < 1 (e.g. a
+// fat-fingered AGENT_HOP_MAX=0, which would otherwise refuse every call) →
+// defaultHopMax. Pure function — table-testable (pass a map-backed getenv).
 func parseHopEnv(getenv func(string) string) (depth, hopMax int) {
 	depth = defaultHopDepth
-	if v, err := strconv.Atoi(strings.TrimSpace(getenv(hopDepthEnv))); err == nil {
+	if v, err := strconv.Atoi(strings.TrimSpace(getenv(hopDepthEnv))); err == nil && v >= 0 {
 		depth = v
 	}
 	hopMax = defaultHopMax
-	if v, err := strconv.Atoi(strings.TrimSpace(getenv(hopMaxEnv))); err == nil {
+	if v, err := strconv.Atoi(strings.TrimSpace(getenv(hopMaxEnv))); err == nil && v >= 1 {
 		hopMax = v
 	}
 	return depth, hopMax
@@ -256,87 +270,88 @@ func main() {
 		server.WithToolCapabilities(false),
 	)
 
-	geminiTool := mcp.NewTool("gemini_agent",
-		mcp.WithDescription(
-			"Spawn a Gemini agent (via the Antigravity `agy` CLI) to perform a task and return its response. "+
-				"Give it a self-contained task in `task`; it runs non-interactively and returns Gemini's full output. "+
-				"By default the spawned agent can reason and answer but CANNOT take unattended actions (no file edits / "+
-				"command execution) — set `allow_tools: true` to let it act, which disables Gemini's permission prompts "+
-				"and (by default) runs it in a restricted sandbox. Use `add_dirs` to give it workspace context and "+
-				"`working_dir` to set where it runs.",
-		),
-		mcp.WithString("task",
-			mcp.Required(),
-			mcp.Description("The complete, self-contained task/prompt for the Gemini agent to perform."),
-		),
-		mcp.WithArray("add_dirs",
-			mcp.Description("Directories to add to the agent's workspace (absolute paths). Repeatable."),
-			mcp.Items(map[string]any{"type": "string"}),
-		),
-		mcp.WithString("working_dir",
-			mcp.Description("Directory the agent runs in (absolute path). Defaults to this server's working directory."),
-		),
-		mcp.WithNumber("timeout_seconds",
-			mcp.Description(fmt.Sprintf("Max seconds to wait for the agent (default %d, max %d).", defaultTimeoutSeconds, maxTimeoutSeconds)),
-		),
-		mcp.WithString("model",
-			mcp.Description("Optional model to use (passed as --model). Leave empty for the CLI default."),
-		),
-		mcp.WithBoolean("allow_tools",
-			mcp.Description("Allow the spawned agent to take actions (edit files in working_dir, run commands) by "+
-				"auto-approving its permission prompts (passes --dangerously-skip-permissions). Default false "+
-				"(reason/answer only). Use with care — this is unattended execution; scope it with working_dir."),
-		),
-		mcp.WithBoolean("sandbox",
-			mcp.Description("Confine the agent to an isolated scratch dir with terminal restrictions (--sandbox). "+
-				"Default false. WARNING: when true, the agent's file edits go to a scratch dir, NOT working_dir — "+
-				"use only for a confined 'compute but don't touch my files' run."),
-		),
-	)
-
-	claudeTool := mcp.NewTool("claude_agent",
-		mcp.WithDescription(
-			"Spawn a Claude agent (via the `claude` CLI) to perform a task and return its response. "+
-				"Give it a self-contained task in `task`; it runs non-interactively (`claude --print`) and returns "+
-				"Claude's full output. By default the spawned agent can reason and answer but CANNOT take unattended "+
-				"actions (no file edits / command execution) — set `allow_tools: true` to let it act, which passes "+
-				"--dangerously-skip-permissions so Claude auto-approves its own permission prompts and runs UNATTENDED "+
-				"(it will edit files / run commands and consume Claude credits without further confirmation). "+
-				"Use `add_dirs` to give it workspace context and `working_dir` to set where it runs. "+
-				"Note: even reason-only runs consume Claude credits.",
-		),
-		mcp.WithString("task",
-			mcp.Required(),
-			mcp.Description("The complete, self-contained task/prompt for the Claude agent to perform."),
-		),
-		mcp.WithArray("add_dirs",
-			mcp.Description("Directories to add to the agent's workspace (absolute paths). Repeatable."),
-			mcp.Items(map[string]any{"type": "string"}),
-		),
-		mcp.WithString("working_dir",
-			mcp.Description("Directory the agent runs in (absolute path). Defaults to this server's working directory."),
-		),
-		mcp.WithNumber("timeout_seconds",
-			mcp.Description(fmt.Sprintf("Max seconds to wait for the agent (default %d, max %d).", defaultTimeoutSeconds, maxTimeoutSeconds)),
-		),
-		mcp.WithString("model",
-			mcp.Description("Optional model to use (passed as --model). Leave empty for the CLI default."),
-		),
-		mcp.WithBoolean("allow_tools",
-			mcp.Description("Allow the spawned agent to take actions (edit files in working_dir, run commands) by "+
-				"auto-approving its permission prompts (passes --dangerously-skip-permissions). Default false "+
-				"(reason/answer only). Use with care — this is unattended execution that consumes Claude credits; "+
-				"scope it with working_dir."),
-		),
-	)
-
-	s.AddTool(geminiTool, makeHandler(geminiBackend, true))
-	s.AddTool(claudeTool, makeHandler(claudeBackend, false))
+	s.AddTool(newGeminiTool(), makeHandler(geminiBackend, true))
+	s.AddTool(newClaudeTool(), makeHandler(claudeBackend, false))
 
 	if err := server.ServeStdio(s); err != nil {
 		fmt.Fprintf(os.Stderr, "agy-mcp: server error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// Tool descriptions. The model-facing prose differs per backend; the parameter
+// set is shared (see commonToolOptions) to keep the two tools from drifting.
+const (
+	geminiToolDescription = "Spawn a Gemini agent (via the Antigravity `agy` CLI) to perform a task and return its " +
+		"response. Give it a self-contained task in `task`; it runs non-interactively and returns Gemini's full " +
+		"output. By default the spawned agent can reason and answer but CANNOT take unattended actions (no file " +
+		"edits / command execution) — set `allow_tools: true` to let it act, which disables Gemini's permission " +
+		"prompts and runs it UNATTENDED, with edits landing in `working_dir`. Sandboxing is OFF by default; set " +
+		"`sandbox: true` to instead confine edits to an isolated scratch dir. Use `add_dirs` for workspace context " +
+		"and `working_dir` to set where it runs."
+
+	claudeToolDescription = "Spawn a Claude agent (via the `claude` CLI) to perform a task and return its response. " +
+		"Give it a self-contained task in `task`; it runs non-interactively (`claude --print`) and returns Claude's " +
+		"full output. By default the spawned agent can reason and answer but CANNOT take unattended actions (no file " +
+		"edits / command execution) — set `allow_tools: true` to let it act, which passes --dangerously-skip-permissions " +
+		"so Claude auto-approves its own permission prompts and runs UNATTENDED (it will edit files / run commands and " +
+		"consume Claude credits without further confirmation). Use `add_dirs` for workspace context and `working_dir` " +
+		"to set where it runs. Note: even reason-only runs consume Claude credits."
+
+	geminiAllowToolsDescription = "Allow the spawned agent to take actions (edit files in working_dir, run commands) by " +
+		"auto-approving its permission prompts (passes --dangerously-skip-permissions). Default false (reason/answer " +
+		"only). Use with care — this is unattended execution; scope it with working_dir."
+
+	claudeAllowToolsDescription = "Allow the spawned agent to take actions (edit files in working_dir, run commands) by " +
+		"auto-approving its permission prompts (passes --dangerously-skip-permissions). Default false (reason/answer " +
+		"only). Use with care — this is unattended execution that consumes Claude credits; scope it with working_dir."
+
+	sandboxDescription = "Confine the agent to an isolated scratch dir with terminal restrictions (--sandbox). Default " +
+		"false. WARNING: when true, the agent's file edits go to a scratch dir, NOT working_dir — use only for a " +
+		"confined 'compute but don't touch my files' run."
+)
+
+// commonToolOptions returns the tool options shared by both tools: the given
+// description plus the task/add_dirs/working_dir/timeout_seconds/model/allow_tools
+// params. Per-tool extras (e.g. gemini's sandbox) are appended by the caller.
+// Defining the shared params once keeps the two tool schemas from drifting.
+func commonToolOptions(description, allowToolsDescription string) []mcp.ToolOption {
+	return []mcp.ToolOption{
+		mcp.WithDescription(description),
+		mcp.WithString("task",
+			mcp.Required(),
+			mcp.Description("The complete, self-contained task/prompt for the agent to perform."),
+		),
+		mcp.WithArray("add_dirs",
+			mcp.Description("Directories to add to the agent's workspace (absolute paths). Repeatable."),
+			mcp.Items(map[string]any{"type": "string"}),
+		),
+		mcp.WithString("working_dir",
+			mcp.Description("Directory the agent runs in (absolute path). Defaults to this server's working directory."),
+		),
+		mcp.WithNumber("timeout_seconds",
+			mcp.Description(fmt.Sprintf("Max seconds to wait for the agent (default %d, max %d).", defaultTimeoutSeconds, maxTimeoutSeconds)),
+		),
+		mcp.WithString("model",
+			mcp.Description("Optional model to use (passed as --model). Leave empty for the CLI default."),
+		),
+		mcp.WithBoolean("allow_tools",
+			mcp.Description(allowToolsDescription),
+		),
+	}
+}
+
+// newGeminiTool builds the gemini_agent tool: the shared params plus gemini's
+// sandbox option.
+func newGeminiTool() mcp.Tool {
+	opts := commonToolOptions(geminiToolDescription, geminiAllowToolsDescription)
+	opts = append(opts, mcp.WithBoolean("sandbox", mcp.Description(sandboxDescription)))
+	return mcp.NewTool("gemini_agent", opts...)
+}
+
+// newClaudeTool builds the claude_agent tool: the shared params only (no sandbox).
+func newClaudeTool() mcp.Tool {
+	return mcp.NewTool("claude_agent", commonToolOptions(claudeToolDescription, claudeAllowToolsDescription)...)
 }
 
 // makeHandler returns the MCP handler for a backend. supportsSandbox controls
@@ -409,9 +424,16 @@ func runAgent(ctx context.Context, b backend, o runOpts) (*mcp.CallToolResult, e
 	args := b.buildArgs(o)
 	modeNote := b.modeNote(o)
 
-	// Give the process a little headroom beyond the requested timeout so we
-	// surface the child's own timeout message rather than killing it first.
-	hardDeadline := time.Duration(o.timeoutSeconds)*time.Second + timeoutHeadroom
+	// Give backends with their own internal timeout (gemini/agy) a little headroom
+	// beyond the requested timeout so they surface their own timeout message rather
+	// than us killing them first. claude has no internal timeout (headroom 0), so
+	// the context deadline IS the timeout. Guard against a negative timeout (a
+	// direct runAgent caller bypassing makeHandler's clamp) collapsing the deadline.
+	effectiveTimeout := o.timeoutSeconds
+	if effectiveTimeout < 0 {
+		effectiveTimeout = 0
+	}
+	hardDeadline := time.Duration(effectiveTimeout)*time.Second + b.timeoutHeadroom
 	runCtx, cancel := context.WithTimeout(ctx, hardDeadline)
 	defer cancel()
 
@@ -421,6 +443,13 @@ func runAgent(ctx context.Context, b backend, o runOpts) (*mcp.CallToolResult, e
 	}
 	// Spawn the child with an incremented delegation depth (no duplicate keys).
 	cmd.Env = childHopEnv(os.Environ(), depth)
+
+	// Kill the whole process group on cancel/timeout (so grandchildren the child
+	// spawned die too) and bound how long Run may block on I/O afterward. Without
+	// this, a surviving grandchild that inherited the stdout/stderr pipes keeps
+	// them open and cmd.Run() hangs past the deadline, leaking the goroutine/fds.
+	setupProcessGroup(cmd)
+	cmd.WaitDelay = childWaitDelay
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -462,14 +491,19 @@ func runAgent(ctx context.Context, b backend, o runOpts) (*mcp.CallToolResult, e
 	return mcp.NewToolResultText(header + out), nil
 }
 
-// truncate returns a copy of s truncated to at most max bytes, without splitting UTF-8 runes.
-func truncate(s string, max int) string {
-	if len(s) <= max {
+// truncate returns a copy of s truncated to at most limit bytes, without
+// splitting UTF-8 runes. A negative limit is treated as 0 (no content kept),
+// guarding against an out-of-range slice panic.
+func truncate(s string, limit int) string {
+	if limit < 0 {
+		limit = 0
+	}
+	if len(s) <= limit {
 		return s
 	}
 	// Back up to a valid UTF-8 rune boundary.
 	// Continuation bytes start with the bits 10xxxxxx, i.e., byte & 0xC0 == 0x80.
-	i := max
+	i := limit
 	for i > 0 && (s[i]&0xC0 == 0x80) {
 		i--
 	}
