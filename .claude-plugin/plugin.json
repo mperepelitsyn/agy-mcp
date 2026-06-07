@@ -1,7 +1,7 @@
 {
   "name": "agy-gemini",
   "version": "0.1.0",
-  "description": "Spawn a Gemini agent (Antigravity `agy` CLI) as an MCP tool, plus a skill teaching Claude when and how to delegate tasks to it.",
+  "description": "Bidirectional agent bridge as an MCP server: exposes `gemini_agent` (spawn a Gemini agent via the Antigravity `agy` CLI) and `claude_agent` (spawn a Claude agent via the `claude` CLI), plus a skill for delegating to Gemini.",
   "author": { "name": "Alexey Dubkov" },
-  "keywords": ["mcp", "gemini", "antigravity", "agy", "subagent"]
+  "keywords": ["mcp", "gemini", "claude", "antigravity", "agy", "bridge", "subagent"]
 }
