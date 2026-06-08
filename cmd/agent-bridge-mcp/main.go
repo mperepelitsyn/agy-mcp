@@ -125,7 +125,8 @@ const (
 		"no-tools mode. Set `allow_tools: true` to let it act, which passes --dangerously-bypass-approvals-and-sandbox " +
 		"so it runs UNATTENDED with full file/command access and NO sandbox, with edits landing in `working_dir`. Use " +
 		"`add_dirs` for additional writable context and `working_dir` to set where it runs. Codex runs even outside a " +
-		"Git repo (--skip-git-repo-check is always passed); its `exec` output is more verbose than a plain print."
+		"Git repo (--skip-git-repo-check is always passed). The tool returns Codex's final message; its session banner " +
+		"and step-by-step transcript go to stderr and are surfaced only if the run fails or times out."
 
 	codexAllowToolsDescription = "Allow the spawned agent to take actions (edit files in working_dir, run commands) by " +
 		"passing --dangerously-bypass-approvals-and-sandbox, which skips ALL approvals AND disables Codex's sandbox. " +
@@ -248,9 +249,13 @@ func (b backend) buildArgs(o runOpts) []string {
 	if !o.allowTools {
 		args = append(args, b.reasonOnlyArgs...)
 	}
-	// Positional prompt goes LAST, after subcmd and every flag.
+	// Positional prompt goes LAST, after subcmd and every flag, preceded by the "--"
+	// end-of-options marker. Without it a task that starts with a dash (e.g.
+	// "--fix the bug") or matches a subcommand name (codex exec's resume/review/help)
+	// is parsed as a flag/subcommand instead of the prompt — codex itself rejects it
+	// with "unexpected argument ... use '-- ...'".
 	if b.promptPositional {
-		args = append(args, o.task)
+		args = append(args, "--", o.task)
 	}
 	return args
 }

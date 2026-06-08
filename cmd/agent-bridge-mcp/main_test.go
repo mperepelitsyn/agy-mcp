@@ -267,29 +267,34 @@ func TestBuildCodexArgs(t *testing.T) {
 		want []string
 	}{
 		{
-			name: "reason-only: exec first, read-only sandbox, prompt LAST",
+			name: "reason-only: exec first, read-only sandbox, prompt LAST after --",
 			in:   runOpts{task: task, timeoutSeconds: 300},
-			want: []string{"exec", "--skip-git-repo-check", "--color", "never", "--sandbox", "read-only", task},
+			want: []string{"exec", "--skip-git-repo-check", "--color", "never", "--sandbox", "read-only", "--", task},
 		},
 		{
-			name: "allow_tools: bypass flag present, no read-only sandbox, prompt LAST",
+			name: "allow_tools: bypass flag present, no read-only sandbox, prompt LAST after --",
 			in:   runOpts{task: task, timeoutSeconds: 300, allowTools: true},
-			want: []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--color", "never", task},
+			want: []string{"exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--color", "never", "--", task},
 		},
 		{
 			name: "model and add_dirs land between exec and the trailing prompt",
 			in:   runOpts{task: task, timeoutSeconds: 300, model: "gpt-5", addDirs: []string{"/a", "/b"}},
-			want: []string{"exec", "--model", "gpt-5", "--add-dir", "/a", "--add-dir", "/b", "--skip-git-repo-check", "--color", "never", "--sandbox", "read-only", task},
+			want: []string{"exec", "--model", "gpt-5", "--add-dir", "/a", "--add-dir", "/b", "--skip-git-repo-check", "--color", "never", "--sandbox", "read-only", "--", task},
 		},
 		{
 			name: "blank model dropped; sandbox bool ignored (codex has no boolean --sandbox)",
 			in:   runOpts{task: task, timeoutSeconds: 300, model: "  ", sandbox: true},
-			want: []string{"exec", "--skip-git-repo-check", "--color", "never", "--sandbox", "read-only", task},
+			want: []string{"exec", "--skip-git-repo-check", "--color", "never", "--sandbox", "read-only", "--", task},
 		},
 		{
 			name: "no --print-timeout even with a custom timeout",
 			in:   runOpts{task: task, timeoutSeconds: 900},
-			want: []string{"exec", "--skip-git-repo-check", "--color", "never", "--sandbox", "read-only", task},
+			want: []string{"exec", "--skip-git-repo-check", "--color", "never", "--sandbox", "read-only", "--", task},
+		},
+		{
+			name: "dash-leading task is shielded by -- (parsed as prompt, not a flag)",
+			in:   runOpts{task: "--fix the bug", timeoutSeconds: 300},
+			want: []string{"exec", "--skip-git-repo-check", "--color", "never", "--sandbox", "read-only", "--", "--fix the bug"},
 		},
 	}
 
@@ -1090,6 +1095,12 @@ func TestBackendRegistry(t *testing.T) {
 			}
 			if b.promptFlag != "" && b.promptPositional {
 				t.Errorf("backend %q sets both promptFlag and promptPositional (ambiguous)", b.tool)
+			}
+			// Every backend exposes allow_tools, and modeNote/buildArgs derive the
+			// enabled mode from skipPermsFlag. An empty one would render the header
+			// "tool-use: ENABLED ()" while buildArgs silently passes no skip flag.
+			if b.skipPermsFlag == "" {
+				t.Errorf("backend %q has empty skipPermsFlag; an allow_tools run would claim ENABLED with no flag", b.tool)
 			}
 			if seen[b.tool] {
 				t.Errorf("duplicate tool name %q in registry", b.tool)

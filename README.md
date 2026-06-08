@@ -77,8 +77,10 @@ sandbox* and *full, unsandboxed access* rather than off/on.
 
 There is **no `sandbox` param** on `codex_agent` — `allow_tools` already selects
 read-only vs. full access. Codex always runs with `--skip-git-repo-check` (so it
-works outside a Git repo), and its `exec` output is more verbose than a plain
-`--print`.
+works outside a Git repo). On success the tool returns Codex's final message;
+Codex's session banner and step-by-step transcript go to **stderr** and are
+surfaced only if the run fails or times out (so a successful result is as clean as
+the other backends, not noisier).
 
 ### Safety model (all tools)
 
